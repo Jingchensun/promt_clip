@@ -42,9 +42,14 @@ class TextEncoder(nn.Module):
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
+        self.token_embedding = clip_model.token_embedding
 
-    def forward(self, prompts, tokenized_prompts):
-        x = prompts + self.positional_embedding.type(self.dtype)
+    #def forward(self, prompts, tokenized_prompts):
+    def forward(self, tokenized_prompts):    
+        #x = prompts + self.positional_embedding.type(self.dtype)
+        x = self.token_embedding(tokenized_prompts).type(self.dtype)
+        #print('self.dtypeself.dtypeself.dtypeself.dtype',self.dtype)
+        x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -56,6 +61,20 @@ class TextEncoder(nn.Module):
 
         return x
 
+    # def encode_text(self, text):
+    #     x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+
+    #     x = x + self.positional_embedding.type(self.dtype)
+    #     x = x.permute(1, 0, 2)  # NLD -> LND
+    #     x = self.transformer(x)
+    #     x = x.permute(1, 0, 2)  # LND -> NLD
+    #     x = self.ln_final(x).type(self.dtype)
+
+    #     # x.shape = [batch_size, n_ctx, transformer.width]
+    #     # take features from the eot embedding (eot_token is the highest number in each sequence)
+    #     x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+
+    #     return x
 
 class PromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
@@ -98,8 +117,10 @@ class PromptLearner(nn.Module):
         classnames = [name.replace("_", " ") for name in classnames]
         print('classnamesclassnames:',len(classnames)) #1000
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames]
-        print('prompt_prefix',prompt_prefix) # X X X X X X X X X X X X X X X X
+        #prompts = [prompt_prefix + " " + name + "." for name in classnames]
+        #print('prompt_prefix',prompt_prefix) # X X X X X X X X X X X X X X X X
+        #######manual change
+        prompts = ['This is a photo of a ' + name + "." for name in classnames]
 
         tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
@@ -184,24 +205,59 @@ class PromptLearner(nn.Module):
         return prompts
 
 
+class PadPrompter(nn.Module):
+    def __init__(self, prompt_size, image_size):
+        super(PadPrompter, self).__init__()
+        pad_size = prompt_size #30
+        image_size = image_size #224
+
+        self.base_size = image_size - pad_size*2
+        self.pad_up = nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
+        self.pad_down = nn.Parameter(torch.randn([1, 3, pad_size, image_size]))
+        self.pad_left = nn.Parameter(torch.randn([1, 3, image_size - pad_size*2, pad_size]))
+        self.pad_right = nn.Parameter(torch.randn([1, 3, image_size - pad_size*2, pad_size]))
+
+    def forward(self, x):
+        base = torch.zeros(1, 3, self.base_size, self.base_size).cuda()
+        prompt = torch.cat([self.pad_left, base, self.pad_right], dim=3)
+        prompt = torch.cat([self.pad_up, prompt, self.pad_down], dim=2)
+        prompt = torch.cat(x.size(0) * [prompt])
+        #print('xxxxxxxsize:',x.size()) #torch.Size([256, 3, 224, 224])
+
+        return x + prompt
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
+        self.pad_prompter = PadPrompter(30,224)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
-        image_features = self.image_encoder(image.type(self.dtype))
 
-        prompts = self.prompt_learner()
+    def forward(self, image):
+        image = self.pad_prompter(image)
+
+        image_features = self.image_encoder(image.type(self.dtype))
+        #print('self.dtypeself.dtypeself.dtypeself.dtype',image_features.device)
+        #print('image size:',image.size()) #torch.Size([8, 3, 224, 224])
+
+        #prompts = self.prompt_learner()
+
         #print('prompts',prompts.size()) #torch.Size([100, 77, 512])
-        tokenized_prompts = self.tokenized_prompts 
+        input_texts = self.tokenized_prompts.cuda()
+        #print('input_textsinput_textsinput_textsinput_texts:',input_texts.device) #torch.Size([100, 77])
+
+
         #print('tokenized_prompts',tokenized_prompts.size()) #tokenized_prompts torch.Size([100, 77])
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+        
+        #text_features = self.text_encoder(prompts, tokenized_prompts)
+        text_features = self.text_encoder(input_texts)
+
+
         #print('text_features',text_features.size()) #text_features torch.Size([100, 1024])
         torch.save(text_features, './mytensor2_3.pt')
         #print('image_features before:',image_features.size()) #torch.Size([25, 1024])
@@ -243,17 +299,26 @@ class CoOp(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "prompt_learner" not in name:
+            # if "prompt_learner" not in name:
+            #     param.requires_grad_(False)
+            if "pad_prompter" not in name:
                 param.requires_grad_(False)
 
         if cfg.MODEL.INIT_WEIGHTS:
+            print('MODEL.INIT_WEIGHTS yes!')
             load_pretrained_weights(self.model.prompt_learner, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
         # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        # self.optim = build_optimizer(self.model.prompt_learner, cfg.OPTIM)
+        # self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
+        # self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+
+        self.optim = build_optimizer(self.model.pad_prompter, cfg.OPTIM)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("prompt_learner", self.model.prompt_learner, self.optim, self.sched)
+        self.register_model("pad_prompter", self.model.pad_prompter, self.optim, self.sched)
+
+
 
         self.scaler = GradScaler() if cfg.TRAINER.COOP.PREC == "amp" else None
 
