@@ -12,6 +12,7 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
+import json
 
 _tokenizer = _Tokenizer()
 
@@ -53,6 +54,31 @@ class TextEncoder(nn.Module):
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+
+        return x
+
+class TextEncoder2(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.token_embedding = clip_model.token_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, text):
+        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        x = x + self.positional_embedding.type(self.dtype)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x).type(self.dtype)
+
+        # x.shape = [batch_size, n_ctx, transformer.width]
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x
 
@@ -191,11 +217,14 @@ class CustomCLIP(nn.Module):
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
+        self.encode_text = TextEncoder2(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
+    def forward(self, image, text_tensor):
         image_features = self.image_encoder(image.type(self.dtype))
+        #print(text_tensor.size())
+        text_features_ori = self.encode_text(text_tensor)
 
         prompts = self.prompt_learner()
         #print('prompts',prompts.size()) #torch.Size([100, 77, 512])
@@ -209,11 +238,18 @@ class CustomCLIP(nn.Module):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        #print('image_features after:',image_features.size()) #torch.Size([25, 1024])
+        # print('image_features after:',image_features.size()) #torch.Size([25, 1024]) caltech torch.Size([8, 1024])
+        # print('text_features.size():',text_features.size()) #caltech torch.Size([100, 1024])
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
+ 
 
-        return logits
+        text_features_ori = text_features_ori / text_features_ori.norm(dim=-1, keepdim=True)
+        logits_per_image_ori = logit_scale * image_features @ text_features_ori.t()
+        logits_per_text_ori = logits_per_image_ori.t()
+
+
+        return logits, logits_per_image_ori, logits_per_text_ori
 
 
 @TRAINER_REGISTRY.register()
@@ -265,20 +301,33 @@ class CoOp(TrainerX):
             self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
-        image, label = self.parse_batch_train(batch)
+        image, label, text_tensor = self.parse_batch_train(batch)
+        #print('len(batch)len(batch)len(batch):',batch['image'].size())
         
         prec = self.cfg.TRAINER.COOP.PREC
+        #print('precprecprecprec:',prec) #fp16
         if prec == "amp":
             with autocast():
-                output = self.model(image)
+                output, logits_text = self.model(image)
                 loss = F.cross_entropy(output, label)
             self.optim.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            output = self.model(image)
-            loss = F.cross_entropy(output, label)
+            
+            output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+            # output, logits_text = self.model(image)
+            #print('output.size():',output.size()) # torch.Size([32, 100])
+            #print('logits_text.size():',logits_text.size()) # torch.Size([100, 32])
+            #print('label.size()',label) #torch.Size([32])
+            loss1 = F.cross_entropy(output, label)
+            ground_truth = torch.arange(32,dtype=torch.long,device=self.device)
+            #print('ground_truth.size():',ground_truth.size())
+
+            loss2 =  (F.cross_entropy(logits_per_image_ori,ground_truth) +  F.cross_entropy(logits_per_text_ori,ground_truth))/2
+            #loss2 =  F.cross_entropy(output,ground_truth)
+            loss = loss1 + loss2
             self.model_backward_and_update(loss)
 
         loss_summary = {
@@ -294,9 +343,28 @@ class CoOp(TrainerX):
     def parse_batch_train(self, batch):
         input = batch["img"]
         label = batch["label"]
+        label2 = label.numpy()
         input = input.to(self.device)
+        #print('input.size()',input.size()) #torch.Size([32, 3, 224, 224])
+        
+        #print('label.size()',label) #label.size() torch.Size([32])
+
+        label_text=[]
+        with open('/home/jason/coop/caltech.json', 'r') as fcc_file:
+            fcc_data = json.load(fcc_file)
+            #print(fcc_data)
+            for i in range(len(label)):
+                #print(str(label2[i]))
+                if str(label2[i]) in fcc_data.keys():
+                    label_promt = 'This is a photo of ' + fcc_data[str(label2[i])]
+                    #print(label_promt)
+                    label_text.append(label_promt)
+        #print(label_text)
         label = label.to(self.device)
-        return input, label
+        text_tensor = clip.tokenize(label_text).to(self.device)
+        #print('text_tensor.size():',text_tensor.size())
+
+        return input, label, text_tensor
 
     def load_model(self, directory, epoch=None):
         if not directory:
