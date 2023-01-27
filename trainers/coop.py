@@ -221,10 +221,11 @@ class CustomCLIP(nn.Module):
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image, text_tensor):
+    def forward(self, image):
         image_features = self.image_encoder(image.type(self.dtype))
-        #print(text_tensor.size())
-        text_features_ori = self.encode_text(text_tensor)
+        #print(image_features.size()) #torch.Size([32, 1024])
+        #text_features_ori = self.encode_text(text_tensor)
+        #print('text_features_ori:',text_features_ori.size()) #torch.Size([32, 1024])
 
         prompts = self.prompt_learner()
         #print('prompts',prompts.size()) #torch.Size([100, 77, 512])
@@ -232,7 +233,7 @@ class CustomCLIP(nn.Module):
         #print('tokenized_prompts',tokenized_prompts.size()) #tokenized_prompts torch.Size([100, 77])
         text_features = self.text_encoder(prompts, tokenized_prompts)
         #print('text_features',text_features.size()) #text_features torch.Size([100, 1024])
-        torch.save(text_features, './mytensor2_3.pt')
+        #torch.save(text_features, './mytensor2_3.pt')
         #print('image_features before:',image_features.size()) #torch.Size([25, 1024])
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -244,12 +245,12 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * image_features @ text_features.t()
  
 
-        text_features_ori = text_features_ori / text_features_ori.norm(dim=-1, keepdim=True)
-        logits_per_image_ori = logit_scale * image_features @ text_features_ori.t()
-        logits_per_text_ori = logits_per_image_ori.t()
+        # text_features_ori = text_features_ori / text_features_ori.norm(dim=-1, keepdim=True)
+        # logits_per_image_ori = logit_scale * image_features @ text_features_ori.t()
+        # logits_per_text_ori = logits_per_image_ori.t()
 
 
-        return logits, logits_per_image_ori, logits_per_text_ori
+        return logits#, logits_per_image_ori, logits_per_text_ori
 
 
 @TRAINER_REGISTRY.register()
@@ -299,12 +300,15 @@ class CoOp(TrainerX):
         if device_count > 1:
             print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
             self.model = nn.DataParallel(self.model)
+    
+
 
     def forward_backward(self, batch):
-        image, label, text_tensor = self.parse_batch_train(batch)
+        image, label= self.parse_batch_train(batch)
         #print('len(batch)len(batch)len(batch):',batch['image'].size())
         
         prec = self.cfg.TRAINER.COOP.PREC
+        loss_set = self.cfg.TRAINER.COOP.LOSS
         #print('precprecprecprec:',prec) #fp16
         if prec == "amp":
             with autocast():
@@ -315,23 +319,96 @@ class CoOp(TrainerX):
             self.scaler.step(self.optim)
             self.scaler.update()
         else:
-            
-            output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
-            # output, logits_text = self.model(image)
-            #print('output.size():',output.size()) # torch.Size([32, 100])
-            #print('logits_text.size():',logits_text.size()) # torch.Size([100, 32])
-            #print('label.size()',label) #torch.Size([32])
-            loss1 = F.cross_entropy(output, label)
-            ground_truth = torch.arange(32,dtype=torch.long,device=self.device)
-            #print('ground_truth.size():',ground_truth.size())
+            if loss_set == "cross_entropy":
+                output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+                # output, logits_text = self.model(image)
+                #print('output.size():',output.size()) # torch.Size([32, 100])
+                #print('logits_text.size():',logits_text.size()) # torch.Size([100, 32])
+                #print('label.size()',label) #torch.Size([32])
+                loss1 = F.cross_entropy(output, label)
+                loss2 = loss1
+                loss = loss1
+                self.model_backward_and_update(loss)
 
-            loss2 =  (F.cross_entropy(logits_per_image_ori,ground_truth) +  F.cross_entropy(logits_per_text_ori,ground_truth))/2
-            #loss2 =  F.cross_entropy(output,ground_truth)
-            loss = loss1 + loss2
-            self.model_backward_and_update(loss)
+            elif loss_set == "cross_contrastive":
+                output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+                # output, logits_text = self.model(image)
+                #print('output.size():',output.size()) # torch.Size([32, 100])
+                #print('logits_text.size():',logits_text.size()) # torch.Size([100, 32])
+                #print('label.size()',label) #torch.Size([32])
+                loss1 = F.cross_entropy(output, label)
+
+                ground_truth = torch.arange(32,dtype=torch.long,device=self.device)
+                loss2 =  (F.cross_entropy(logits_per_image_ori,ground_truth) +  F.cross_entropy(logits_per_text_ori,ground_truth))/2
+                #loss2 =  F.cross_entropy(output,ground_truth)
+                loss = loss1 + loss2
+                self.model_backward_and_update(loss)
+
+            elif loss_set == "unicl_loss":
+                # #print(label)
+                # output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+                # logits_per_image_ori, logits_per_text_ori = logits_per_image_ori.type(torch.DoubleTensor), logits_per_text_ori.type(torch.DoubleTensor)
+                # print(logits_per_image_ori.size(),logits_per_text_ori.size()) #torch.Size([32, 32]) torch.Size([32, 32])
+                # target = self.targetM(label.cpu())#.to(self.device)
+                # #print('target',target)
+
+                # i2t = self.SoftCE(logits_per_image_ori, target)
+                # #print(logits_per_image_ori)
+                # t2i = self.SoftCE(logits_per_text_ori, target.T)
+                # #print(t2i)
+                # loss = (i2t + t2i) / 2
+                # print('loss:',loss)
+                # self.model_backward_and_update(loss)
+
+                output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+                print('output',output.requires_grad)
+
+
+                logits_per_image_ori, logits_per_text_ori = logits_per_image_ori.type(torch.FloatTensor).to(self.device), logits_per_text_ori.type(torch.FloatTensor).to(self.device)
+                print(logits_per_image_ori.requires_grad,logits_per_text_ori.requires_grad) #torch.Size([32, 32]) torch.Size([32, 32])
+                target = self.targetM(label.cpu()).to(self.device)
+                print('target',target.requires_grad)
+
+                i2t = self.SoftCE(logits_per_image_ori, target)
+                #print(logits_per_image_ori)
+                t2i = self.SoftCE(logits_per_text_ori, target.T)
+                #print(t2i)
+                loss = (i2t + t2i) / 2
+                print('loss:',loss)
+                self.model_backward_and_update(loss)
+            elif loss_set == "cross_contrastive_loss":
+                output= self.model(image)
+                # output, logits_per_image_ori, logits_per_text_ori = self.model(image, text_tensor)
+                # print('output',output.shape)
+                # print('output0',len(output))
+                # print('output1',len(output[1]))
+
+                # target = self.targetM(label.cpu()).to(self.device)
+                ground_truth_i = torch.arange(len(output),dtype=torch.long,device=self.device)
+                ground_truth_t = torch.arange(len(output[0]),dtype=torch.long,device=self.device)
+                output = output.type(torch.FloatTensor).cuda()
+                # print(output.size(),output.T.size())
+                # ground_truth_i = torch.arange(32,dtype=torch.long,device='cpu')
+                # ground_truth_t = torch.arange(100,dtype=torch.long,device='cpu')
+                loss1 = F.cross_entropy(output, ground_truth_i)
+                
+                # print('loss1:',loss1)
+                output_t = output.T
+                x = torch.zeros(len(output[0]), (len(output[0])-len(output))).cuda()
+                z = torch.cat((x,output_t),1).cuda()
+                #print(z.size())#torch.Size([100, 100])
+                loss2 = F.cross_entropy(z, ground_truth_t)
+
+                loss3 = F.cross_entropy(output, label) 
+
+                loss = ((loss1+loss2) / 2) + loss3
+                #loss = loss1 + loss3
+                self.model_backward_and_update(loss)
 
         loss_summary = {
             "loss": loss.item(),
+            "loss1": loss1.item(),
+            "loss2": loss2.item(),
             "acc": compute_accuracy(output, label)[0].item(),
         }
 
@@ -340,31 +417,44 @@ class CoOp(TrainerX):
 
         return loss_summary
 
+    def targetM(self, y):
+        print('y:',y)
+        cap_m = (y == 0).sum()
+        cls_m = y[y>0].max()
+        y[y==0] = torch.arange(0, cap_m) + cls_m + 1
+        return y.view(-1, 1) == y.view(1, -1)
+
+    def SoftCE(self, s, t):
+        s = torch.softmax(s, dim=-1)
+        loss = - (t * s.log()).sum(dim = -1)
+        return (loss/t.sum(dim=-1)).mean()
+
     def parse_batch_train(self, batch):
         input = batch["img"]
         label = batch["label"]
-        label2 = label.numpy()
+        # label2 = label.numpy()
         input = input.to(self.device)
         #print('input.size()',input.size()) #torch.Size([32, 3, 224, 224])
         
         #print('label.size()',label) #label.size() torch.Size([32])
 
-        label_text=[]
-        with open('/home/jason/coop/caltech.json', 'r') as fcc_file:
-            fcc_data = json.load(fcc_file)
-            #print(fcc_data)
-            for i in range(len(label)):
-                #print(str(label2[i]))
-                if str(label2[i]) in fcc_data.keys():
-                    label_promt = 'This is a photo of ' + fcc_data[str(label2[i])]
-                    #print(label_promt)
-                    label_text.append(label_promt)
+        # label_text=[]
+        # with open('/home/jason/coop/caltech.json', 'r') as fcc_file:
+        #     fcc_data = json.load(fcc_file)
+        #     #print(fcc_data)
+        #     for i in range(len(label)):
+        #         #print(str(label2[i]))
+        #         if str(label2[i]) in fcc_data.keys():
+        #             label_promt = 'This is a photo of ' + fcc_data[str(label2[i])]
+        #             #print(label_promt)
+        #             label_text.append(label_promt)
         #print(label_text)
         label = label.to(self.device)
-        text_tensor = clip.tokenize(label_text).to(self.device)
+        # print('label:',label)
+        # text_tensor = clip.tokenize(label_text).to(self.device)
         #print('text_tensor.size():',text_tensor.size())
 
-        return input, label, text_tensor
+        return input, label#, text_tensor
 
     def load_model(self, directory, epoch=None):
         if not directory:

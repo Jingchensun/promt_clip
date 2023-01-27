@@ -1,0 +1,3 @@
+Collecting env info ...
+<class 'datasets.caltech101.Caltech101'>
+Reading split from /home/jason/coop/data/caltech-101/split_zhou_Caltech101.json
