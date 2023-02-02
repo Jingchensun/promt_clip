@@ -393,22 +393,22 @@ class CoOp(TrainerX):
                 loss1 = F.cross_entropy(output, ground_truth_i)
                 
                 # print('loss1:',loss1)
-                output_t = output.T
-                x = torch.zeros(len(output[0]), (len(output[0])-len(output))).cuda()
-                z = torch.cat((x,output_t),1).cuda()
-                #print(z.size())#torch.Size([100, 100])
-                loss2 = F.cross_entropy(z, ground_truth_t)
+                # output_t = output.T
+                # x = torch.zeros(len(output[0]), (len(output[0])-len(output))).cuda()
+                # z = torch.cat((x,output_t),1).cuda()
+                # #print(z.size())#torch.Size([100, 100])
+                # loss2 = F.cross_entropy(z, ground_truth_t)
 
                 loss3 = F.cross_entropy(output, label) 
 
-                loss = ((loss1+loss2) / 2) + loss3
-                #loss = loss1 + loss3
+                #loss = ((loss1+loss2) / 2) + loss3
+                loss = loss1 + loss3
                 self.model_backward_and_update(loss)
 
         loss_summary = {
             "loss": loss.item(),
             "loss1": loss1.item(),
-            "loss2": loss2.item(),
+            "loss3": loss3.item(),
             "acc": compute_accuracy(output, label)[0].item(),
         }
 
