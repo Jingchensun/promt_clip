@@ -22,6 +22,21 @@ cd prompt_tipadapter
 ln -s /data/jason/data/coopdata data/
 ```
 
+Or follow [DATASETS.md](DATASETS.md) to install the datasets from [CoOp](https://github.com/KaiyangZhou/CoOp/tree/main/datasets) for multitask prompt initialization. Or run the following script(11 datasets, include ImageNet): 
+```bash
+bash scripts/data.sh
+```
+
+If you only failed on the ImageNet, you can simply run the following script: 
+```bash
+bash scripts/imagenet.sh
+```
+
+
+
+
+
+
 
 ### Step 3-1: Few Shot Training
 All you need is `CoOp/scripts/coop/main.sh`, which contains six input arguments.
